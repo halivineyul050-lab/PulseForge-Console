@@ -12,6 +12,7 @@ const si = require("systeminformation");
 const WebSocket = require("ws");
 const { SqliteStore } = require("./sqlite-store");
 const { AlertNotifier } = require("./notifier");
+const { IncidentAiAnalyzer } = require("./ai-analyzer");
 
 const PORT = Number(process.env.PORT || 4510);
 const MAX_HISTORY_POINTS = Number(process.env.HISTORY_POINT_LIMIT || 20000);
@@ -23,11 +24,23 @@ const WINDOWS_DISK_REFRESH_INTERVAL_MS = Number(process.env.WINDOWS_DISK_REFRESH
 const SQLITE_DB_PATH = process.env.SQLITE_DB_PATH || path.join(__dirname, "data", "pulseforge.db");
 const SQLITE_RETENTION_DAYS = Number(process.env.SQLITE_RETENTION_DAYS || 7);
 const SQLITE_ENABLED = process.env.SQLITE_ENABLED !== "0";
+const SQLITE_STRICT_STARTUP = process.env.SQLITE_STRICT_STARTUP !== "0";
+const HELLO_BOOTSTRAP_HISTORY_MINUTES = Math.max(5, Number(process.env.HELLO_BOOTSTRAP_HISTORY_MINUTES || 15));
 const AGENT_API_KEY = String(process.env.AGENT_API_KEY || "").trim();
 const AGENT_BODY_LIMIT = process.env.AGENT_BODY_LIMIT || "2mb";
 const HOST_ONLINE_TIMEOUT_MS = Number(process.env.HOST_ONLINE_TIMEOUT_MS || 15000);
 const HISTORY_QUERY_LIMIT_MAX = Number(process.env.HISTORY_QUERY_LIMIT_MAX || 500000);
 const AGENT_BATCH_LIMIT = Number(process.env.AGENT_BATCH_LIMIT || 120);
+
+const AI_ANALYZER_ENABLED = process.env.AI_ANALYZER_ENABLED !== "0";
+const AI_ANALYZER_API_KEY = String(process.env.AI_ANALYZER_API_KEY || process.env.OPENAI_API_KEY || "").trim();
+const AI_ANALYZER_BASE_URL = String(process.env.AI_ANALYZER_BASE_URL || "https://api.openai.com/v1").trim();
+const AI_ANALYZER_MODEL = String(process.env.AI_ANALYZER_MODEL || "gpt-4o-mini").trim();
+const AI_ANALYZER_TIMEOUT_MS = Math.max(1000, Number(process.env.AI_ANALYZER_TIMEOUT_MS || 8000));
+const AI_ANALYZER_MAX_INPUT_CHARS = Math.max(3000, Number(process.env.AI_ANALYZER_MAX_INPUT_CHARS || 12000));
+const AI_ANALYZER_CACHE_MAX = Math.max(200, Number(process.env.AI_ANALYZER_CACHE_MAX || 5000));
+const AI_ANALYZER_MAX_CONCURRENCY = Math.max(1, Number(process.env.AI_ANALYZER_MAX_CONCURRENCY || 2));
+const AI_ANALYZER_QUEUE_LIMIT = Math.max(100, Number(process.env.AI_ANALYZER_QUEUE_LIMIT || 1200));
 
 const NOTIFIER_TIMEOUT_MS = Number(process.env.NOTIFIER_TIMEOUT_MS || 5000);
 const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL;
@@ -122,6 +135,31 @@ const state = {
 
 const remoteHosts = new Map();
 const socketSubscriptions = new Map();
+const eventAiAnalysisCache = new Map();
+const pendingEventAnalyses = new Set();
+const aiAnalysisQueue = [];
+let aiAnalysisInFlight = 0;
+const analysisNotifyState = new Map();
+
+const storageStatus = {
+  configured: SQLITE_ENABLED,
+  strictStartup: SQLITE_STRICT_STARTUP,
+  ready: false,
+  degraded: false,
+  error: "",
+  dbPath: SQLITE_DB_PATH,
+  retentionDays: SQLITE_RETENTION_DAYS,
+  initializedAt: 0
+};
+
+const aiAnalyzer = new IncidentAiAnalyzer({
+  enabled: AI_ANALYZER_ENABLED,
+  apiKey: AI_ANALYZER_API_KEY,
+  baseUrl: AI_ANALYZER_BASE_URL,
+  model: AI_ANALYZER_MODEL,
+  timeoutMs: AI_ANALYZER_TIMEOUT_MS,
+  maxInputChars: AI_ANALYZER_MAX_INPUT_CHARS
+});
 
 let storage = null;
 const notifier = new AlertNotifier({
@@ -1777,9 +1815,9 @@ function buildHelloPayload(hostIdInput) {
     sourceMode: "auto"
   });
   const historyResult = readHostHistoryBySource(hostId, {
-    fromTs: Date.now() - 5 * 60 * 1000,
+    fromTs: Date.now() - HELLO_BOOTSTRAP_HISTORY_MINUTES * 60 * 1000,
     toTs: Date.now(),
-    limit: 400,
+    limit: Math.max(400, HELLO_BOOTSTRAP_HISTORY_MINUTES * 120),
     sourceMode: "auto"
   });
 
@@ -1789,14 +1827,21 @@ function buildHelloPayload(hostIdInput) {
     config: collectorConfigPayload(),
     latest,
     activeAlerts: hostSnapshot ? activeAlertsFromHostSnapshot(hostSnapshot) : [],
-    events: eventsResult.events,
+    events: eventsWithAiAnalysis(eventsResult.events),
     history: historyResult.points,
     historySource: historyResult.source,
     eventsSource: eventsResult.source,
     hosts: latestHostList(),
     server: {
       localHostId: LOCAL_HOST_ID,
-      sqliteEnabled: Boolean(storage)
+      sqliteEnabled: storageStatus.ready && Boolean(storage),
+      bootstrapHistoryMinutes: HELLO_BOOTSTRAP_HISTORY_MINUTES,
+      storage: storageStatusPayload(),
+      aiAnalyzer: {
+        enabled: aiAnalyzer.enabled,
+        model: aiAnalyzer.model,
+        providerConfigured: aiAnalyzer.providerConfigured
+      }
     }
   };
 }
@@ -1891,6 +1936,367 @@ function notifyEventsAsync(hostSnapshot, events, sample) {
   });
 }
 
+function shouldNotifyAnalysisUpdate(record) {
+  if (!record || !record.eventId) {
+    return false;
+  }
+
+  const key = String(record.eventId);
+  const nextStatus = String(record.status || "unknown");
+  const previousStatus = analysisNotifyState.get(key);
+  if (previousStatus === nextStatus) {
+    return false;
+  }
+
+  analysisNotifyState.set(key, nextStatus);
+  if (analysisNotifyState.size > AI_ANALYZER_CACHE_MAX) {
+    const overflow = analysisNotifyState.size - AI_ANALYZER_CACHE_MAX;
+    const keys = Array.from(analysisNotifyState.keys()).slice(0, overflow);
+    for (const staleKey of keys) {
+      analysisNotifyState.delete(staleKey);
+    }
+  }
+  return true;
+}
+
+function notifyAnalysisResultAsync({ hostId, event, record, sample = null }) {
+  if (!notifier.enabled || !event || !record || String(record.status || "") === "pending") {
+    return;
+  }
+
+  if (!shouldNotifyAnalysisUpdate(record)) {
+    return;
+  }
+
+  const hostSnapshot = hostSnapshotForAnalysis(hostId);
+  notifier.notifyAnalysisUpdate({
+    hostSnapshot,
+    event,
+    analysisRecord: record,
+    sample
+  }).catch((error) => {
+    console.warn(`[notifier] analysis update failed: ${error.message}`);
+  });
+}
+
+function storageStatusPayload() {
+  return {
+    configured: storageStatus.configured,
+    strictStartup: storageStatus.strictStartup,
+    ready: storageStatus.ready,
+    degraded: storageStatus.degraded,
+    enabled: storageStatus.ready && Boolean(storage),
+    dbPath: storageStatus.dbPath,
+    retentionDays: storageStatus.retentionDays,
+    initializedAt: storageStatus.initializedAt || 0,
+    error: storageStatus.error || ""
+  };
+}
+
+function trimEventAiCache() {
+  if (eventAiAnalysisCache.size <= AI_ANALYZER_CACHE_MAX) {
+    return;
+  }
+
+  const overflow = eventAiAnalysisCache.size - AI_ANALYZER_CACHE_MAX;
+  const keys = Array.from(eventAiAnalysisCache.keys()).slice(0, overflow);
+  for (const key of keys) {
+    eventAiAnalysisCache.delete(key);
+  }
+}
+
+function saveEventAiAnalysisToCache(eventId, record) {
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId || !record) {
+    return;
+  }
+
+  if (eventAiAnalysisCache.has(normalizedEventId)) {
+    eventAiAnalysisCache.delete(normalizedEventId);
+  }
+  eventAiAnalysisCache.set(normalizedEventId, record);
+  trimEventAiCache();
+}
+
+function readEventAiAnalysisFromStorage(eventId) {
+  if (!storage || typeof storage.getEventAnalysis !== "function") {
+    return null;
+  }
+
+  try {
+    return storage.getEventAnalysis(eventId);
+  } catch (error) {
+    console.warn(`[storage] read event AI analysis failed: ${error.message}`);
+    return null;
+  }
+}
+
+function persistEventAiAnalysisToStorage(record) {
+  if (!storage || typeof storage.upsertEventAnalysis !== "function" || !record) {
+    return;
+  }
+
+  try {
+    storage.upsertEventAnalysis(record);
+  } catch (error) {
+    console.warn(`[storage] persist event AI analysis failed: ${error.message}`);
+  }
+}
+
+function getEventAiAnalysis(eventId) {
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId) {
+    return null;
+  }
+
+  if (eventAiAnalysisCache.has(normalizedEventId)) {
+    const cached = eventAiAnalysisCache.get(normalizedEventId);
+    saveEventAiAnalysisToCache(normalizedEventId, cached);
+    return cached;
+  }
+
+  const stored = readEventAiAnalysisFromStorage(normalizedEventId);
+  if (stored) {
+    saveEventAiAnalysisToCache(normalizedEventId, stored);
+  }
+  return stored;
+}
+
+function eventWithAiAnalysis(event) {
+  if (!event || typeof event !== "object") {
+    return event;
+  }
+
+  const analysis = getEventAiAnalysis(event.id);
+  if (!analysis) {
+    return {
+      ...event,
+      aiAnalysis: null
+    };
+  }
+
+  return {
+    ...event,
+    aiAnalysis: analysis
+  };
+}
+
+function eventsWithAiAnalysis(events) {
+  if (!Array.isArray(events) || events.length === 0) {
+    return [];
+  }
+  return events.map((event) => eventWithAiAnalysis(event));
+}
+
+function findEventById(hostIdInput, eventIdInput) {
+  const hostId = resolveHostIdFromInput(hostIdInput);
+  const eventId = String(eventIdInput || "").trim();
+  if (!eventId) {
+    return null;
+  }
+
+  const hostSnapshot = getHostSnapshot(hostId);
+  if (hostSnapshot?.events) {
+    const inMemory = hostSnapshot.events.find((event) => String(event?.id) === eventId);
+    if (inMemory) {
+      return inMemory;
+    }
+  }
+
+  if (typeof storage?.getEventById === "function") {
+    try {
+      const stored = storage.getEventById(hostId, eventId);
+      if (stored) {
+        return stored;
+      }
+    } catch (error) {
+      console.warn(`[storage] getEventById failed: ${error.message}`);
+    }
+  }
+
+  const rangeEvents = readHostEventsBySource(hostId, {
+    fromTs: Date.now() - 7 * 24 * 60 * 60 * 1000,
+    toTs: Date.now(),
+    limit: 2000,
+    sourceMode: "auto"
+  }).events;
+
+  return rangeEvents.find((event) => String(event?.id) === eventId) || null;
+}
+
+function hostSnapshotForAnalysis(hostIdInput) {
+  const hostId = resolveHostIdFromInput(hostIdInput);
+  const host = hostIdentity(hostId);
+  return {
+    hostId: host.hostId,
+    hostName: host.hostName,
+    source: host.source
+  };
+}
+
+async function analyzeEventIncident({ hostId, eventId, force = false, eventOverride = null, sampleOverride = null }) {
+  const normalizedHostId = resolveHostIdFromInput(hostId);
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId) {
+    return null;
+  }
+
+  if (!force) {
+    const existing = getEventAiAnalysis(normalizedEventId);
+    if (existing && existing.status !== "pending") {
+      return existing;
+    }
+  }
+
+  const event = eventOverride || findEventById(normalizedHostId, normalizedEventId);
+  if (!event) {
+    return null;
+  }
+
+  const eventTs = safeTimestamp(event.ts, Date.now());
+  const historyResult = readHostHistoryBySource(normalizedHostId, {
+    fromTs: Math.max(0, eventTs - 10 * 60 * 1000),
+    toTs: eventTs + 2 * 60 * 1000,
+    limit: 600,
+    sourceMode: "auto"
+  });
+
+  const hostSnapshot = hostSnapshotForAnalysis(normalizedHostId);
+  const ai = await aiAnalyzer.analyzeIncident({
+    hostSnapshot,
+    event,
+    sample: sampleOverride || resolveLatestSampleForHost(normalizedHostId),
+    history: historyResult.points
+  });
+
+  const record = {
+    eventId: normalizedEventId,
+    hostId: normalizedHostId,
+    eventTs,
+    status: String(ai?.status || "fallback"),
+    model: String(ai?.model || aiAnalyzer.model || "none"),
+    analysis: ai,
+    updatedAt: Date.now()
+  };
+
+  persistEventAiAnalysisToStorage(record);
+  saveEventAiAnalysisToCache(normalizedEventId, record);
+  return record;
+}
+
+function markEventAnalysisPending({ hostId, eventId, eventTs }) {
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId) {
+    return;
+  }
+
+  const pendingRecord = {
+    eventId: normalizedEventId,
+    hostId: resolveHostIdFromInput(hostId),
+    eventTs: safeTimestamp(eventTs, Date.now()),
+    status: "pending",
+    model: aiAnalyzer.model,
+    analysis: {
+      status: "pending",
+      cause: {
+        summary: "分析任务已进入队列，请稍候。",
+        category: "pending",
+        affectedComponent: "event",
+        confidence: 0
+      },
+      evidence: [],
+      remediation: {
+        immediate: [],
+        next24h: [],
+        prevention: []
+      },
+      meta: {
+        fallbackReason: null
+      }
+    },
+    updatedAt: Date.now()
+  };
+
+  saveEventAiAnalysisToCache(normalizedEventId, pendingRecord);
+}
+
+function pumpAiAnalysisQueue() {
+  while (aiAnalysisInFlight < AI_ANALYZER_MAX_CONCURRENCY && aiAnalysisQueue.length > 0) {
+    const task = aiAnalysisQueue.shift();
+    if (!task) {
+      continue;
+    }
+
+    aiAnalysisInFlight += 1;
+    analyzeEventIncident(task)
+      .then((record) => {
+        if (record) {
+          notifyAnalysisResultAsync({
+            hostId: task.hostId,
+            event: task.eventOverride || findEventById(task.hostId, task.eventId),
+            record,
+            sample: task.sampleOverride || resolveLatestSampleForHost(task.hostId)
+          });
+        }
+      })
+      .catch((error) => {
+        console.warn(`[ai] analyze event failed: ${error.message}`);
+      })
+      .finally(() => {
+        aiAnalysisInFlight = Math.max(0, aiAnalysisInFlight - 1);
+        pendingEventAnalyses.delete(task.eventId);
+        setImmediate(pumpAiAnalysisQueue);
+      });
+  }
+}
+
+function enqueueEventAnalysis(task) {
+  const eventId = String(task?.eventId || "").trim();
+  if (!eventId) {
+    return;
+  }
+
+  if (pendingEventAnalyses.has(eventId) || getEventAiAnalysis(eventId)) {
+    return;
+  }
+
+  if (aiAnalysisQueue.length >= AI_ANALYZER_QUEUE_LIMIT) {
+    return;
+  }
+
+  pendingEventAnalyses.add(eventId);
+  markEventAnalysisPending(task);
+  aiAnalysisQueue.push(task);
+  pumpAiAnalysisQueue();
+}
+
+function analyzeEventsAsync(hostId, events, sample = null) {
+  if (!Array.isArray(events) || events.length === 0) {
+    return;
+  }
+
+  for (const event of events) {
+    if (!event || typeof event !== "object") {
+      continue;
+    }
+
+    const eventType = String(event.type || "event");
+    const shouldAnalyze = eventType === "trigger" || eventType === "resolve" || eventType === "event";
+    if (!shouldAnalyze) {
+      continue;
+    }
+
+    enqueueEventAnalysis({
+      hostId,
+      eventId: event.id,
+      force: false,
+      eventOverride: event,
+      sampleOverride: sample,
+      eventTs: event.ts
+    });
+  }
+}
+
 async function collectorTick() {
   if (state.collectorBusy) {
     state.stats.ticksSkippedBusy += 1;
@@ -1921,8 +2327,10 @@ async function collectorTick() {
     broadcastMessageToHost(LOCAL_HOST_ID, { type: "sample", payload: sample });
 
     if (sample.events.length > 0) {
-      broadcastMessageToHost(LOCAL_HOST_ID, { type: "events", payload: sample.events });
-      notifyEventsAsync(localSnapshot, sample.events, sample);
+      analyzeEventsAsync(LOCAL_HOST_ID, sample.events, sample);
+      const enrichedEvents = eventsWithAiAnalysis(sample.events);
+      broadcastMessageToHost(LOCAL_HOST_ID, { type: "events", payload: enrichedEvents });
+      notifyEventsAsync(localSnapshot, enrichedEvents, sample);
     }
 
     const hostsBroadcastTick = Math.max(1, Math.round(5000 / state.sampleRateMs));
@@ -2171,11 +2579,13 @@ function ingestRemoteSampleBundle({
   });
 
   if (normalizedSample.events.length > 0) {
+    analyzeEventsAsync(runtime.hostId, normalizedSample.events, normalizedSample);
+    const enrichedEvents = eventsWithAiAnalysis(normalizedSample.events);
     broadcastMessageToHost(runtime.hostId, {
       type: "events",
-      payload: normalizedSample.events
+      payload: enrichedEvents
     });
-    notifyEventsAsync(runtime, normalizedSample.events, normalizedSample);
+    notifyEventsAsync(runtime, enrichedEvents, normalizedSample);
   }
 
   return {
@@ -2204,14 +2614,20 @@ app.get("/api/health", (req, res) => {
       online: onlineHosts,
       localHostId: LOCAL_HOST_ID
     },
-    storage: {
-      enabled: Boolean(storage),
-      retentionDays: SQLITE_RETENTION_DAYS
+    storage: storageStatusPayload(),
+    aiAnalyzer: {
+      enabled: aiAnalyzer.enabled,
+      model: aiAnalyzer.model,
+      providerConfigured: aiAnalyzer.providerConfigured
     },
     notifier: {
       enabled: notifier.enabled
     }
   });
+});
+
+app.get("/api/storage/status", (req, res) => {
+  res.json(storageStatusPayload());
 });
 
 app.get("/api/notifier", (req, res) => {
@@ -2399,10 +2815,11 @@ app.get("/api/diagnostics", (req, res) => {
     meta: state.meta,
     config: collectorConfigPayload(),
     stats: collectorStatsPayload(),
-    storage: {
-      enabled: Boolean(storage),
-      dbPath: SQLITE_DB_PATH,
-      retentionDays: SQLITE_RETENTION_DAYS
+    storage: storageStatusPayload(),
+    aiAnalyzer: {
+      enabled: aiAnalyzer.enabled,
+      model: aiAnalyzer.model,
+      providerConfigured: aiAnalyzer.providerConfigured
     },
     notifier: {
       enabled: notifier.enabled,
@@ -2458,7 +2875,13 @@ app.get("/api/meta", (req, res) => {
     config: collectorConfigPayload(),
     server: {
       localHostId: LOCAL_HOST_ID,
-      sqliteEnabled: Boolean(storage)
+      sqliteEnabled: storageStatus.ready && Boolean(storage),
+      storage: storageStatusPayload(),
+      aiAnalyzer: {
+        enabled: aiAnalyzer.enabled,
+        model: aiAnalyzer.model,
+        providerConfigured: aiAnalyzer.providerConfigured
+      }
     }
   });
 });
@@ -2590,7 +3013,153 @@ app.get("/api/events", (req, res) => {
     source: result.source,
     requestedSource: sourceMode,
     count: result.events.length,
-    events: result.events
+    events: eventsWithAiAnalysis(result.events)
+  });
+});
+
+app.get("/api/events/analysis", async (req, res) => {
+  const hostId = hostIdFromRequest(req);
+  const eventId = String(req.query.eventId || "").trim();
+  const force = parseBoolean(req.query.force, false);
+
+  if (!eventId) {
+    res.status(400).json({
+      ok: false,
+      message: "eventId is required"
+    });
+    return;
+  }
+
+  let record = null;
+  try {
+    record = await analyzeEventIncident({
+      hostId,
+      eventId,
+      force
+    });
+  } catch (error) {
+    res.status(200).json({
+      ok: false,
+      hostId,
+      eventId,
+      analysis: {
+        eventId,
+        hostId,
+        eventTs: Date.now(),
+        status: "error",
+        model: aiAnalyzer.model,
+        analysis: {
+          status: "error",
+          cause: {
+            summary: `AI 分析失败: ${String(error.message || error)}`,
+            category: "unknown",
+            affectedComponent: "event",
+            confidence: 0
+          },
+          evidence: [],
+          remediation: {
+            immediate: ["稍后重试，或检查 AI 分析服务配置"],
+            next24h: [],
+            prevention: []
+          },
+          meta: {
+            fallbackReason: "analysis_exception"
+          }
+        },
+        updatedAt: Date.now()
+      }
+    });
+    return;
+  }
+
+  if (!record) {
+    res.status(404).json({
+      ok: false,
+      message: "Event not found",
+      hostId,
+      eventId
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    hostId,
+    eventId,
+    analysis: record
+  });
+});
+
+app.post("/api/events/analysis", async (req, res) => {
+  const hostId = resolveHostIdFromInput(req.body?.hostId || req.body?.host || LOCAL_HOST_ID);
+  const eventId = String(req.body?.eventId || "").trim();
+  const force = parseBoolean(req.body?.force, false);
+
+  if (!eventId) {
+    res.status(400).json({
+      ok: false,
+      message: "eventId is required"
+    });
+    return;
+  }
+
+  let record = null;
+  try {
+    record = await analyzeEventIncident({
+      hostId,
+      eventId,
+      force
+    });
+  } catch (error) {
+    res.status(200).json({
+      ok: false,
+      hostId,
+      eventId,
+      analysis: {
+        eventId,
+        hostId,
+        eventTs: Date.now(),
+        status: "error",
+        model: aiAnalyzer.model,
+        analysis: {
+          status: "error",
+          cause: {
+            summary: `AI 分析失败: ${String(error.message || error)}`,
+            category: "unknown",
+            affectedComponent: "event",
+            confidence: 0
+          },
+          evidence: [],
+          remediation: {
+            immediate: ["稍后重试，或检查 AI 分析服务配置"],
+            next24h: [],
+            prevention: []
+          },
+          meta: {
+            fallbackReason: "analysis_exception"
+          }
+        },
+        updatedAt: Date.now()
+      }
+    });
+    return;
+  }
+
+  if (!record) {
+    res.status(404).json({
+      ok: false,
+      message: "Event not found",
+      hostId,
+      eventId
+    });
+    return;
+  }
+
+  res.json({
+    ok: true,
+    hostId,
+    eventId,
+    analysis: record
   });
 });
 
@@ -2695,18 +3264,33 @@ wss.on("connection", (socket, request) => {
 });
 
 async function bootstrap() {
+  storageStatus.initializedAt = Date.now();
+
   if (SQLITE_ENABLED) {
     try {
       storage = new SqliteStore({
         dbPath: SQLITE_DB_PATH,
         retentionDays: SQLITE_RETENTION_DAYS
       });
+      storageStatus.ready = true;
+      storageStatus.degraded = false;
+      storageStatus.error = "";
       console.log(`[PulseForge] sqlite enabled: ${SQLITE_DB_PATH}`);
     } catch (error) {
       storage = null;
+      storageStatus.ready = false;
+      storageStatus.degraded = true;
+      storageStatus.error = String(error.message || error);
       console.warn(`[PulseForge] sqlite disabled: ${error.message}`);
+
+      if (SQLITE_STRICT_STARTUP) {
+        throw new Error(`SQLITE_STRICT_STARTUP=1 and sqlite init failed: ${error.message}`);
+      }
     }
   } else {
+    storageStatus.ready = false;
+    storageStatus.degraded = false;
+    storageStatus.error = "SQLITE_ENABLED=0";
     console.log("[PulseForge] sqlite disabled by SQLITE_ENABLED=0");
   }
 
@@ -2739,6 +3323,7 @@ function shutdown(signal) {
       console.warn(`[storage] close failed: ${error.message}`);
     } finally {
       storage = null;
+      storageStatus.ready = false;
     }
   }
 

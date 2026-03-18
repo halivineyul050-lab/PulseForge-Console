@@ -11,6 +11,8 @@
 - SQLite 历史持久化 + 趋势回放
 - 告警通知通道（Webhook/企业微信/钉钉）
 - 多主机监控（Agent 上报 + 主控台主机切换）
+- 事件级 AI 根因分析（可选接入 LLM，无 Key 时本地回退）
+- 告警消息可附带 AI 诊断摘要，分析完成后自动补发“AI分析更新”通知
 
 ---
 
@@ -128,6 +130,7 @@ npm run smoke
 - `EVENT_POINT_LIMIT`：服务端事件数上限（默认 `600`）
 - `WINDOWS_DISK_REFRESH_INTERVAL_MS`：Windows 磁盘计数器刷新间隔（默认 `2000`）
 - `SQLITE_ENABLED`：是否启用 SQLite（默认 `1`，设为 `0` 可关闭）
+- `SQLITE_STRICT_STARTUP`：SQLite 初始化失败时是否阻止服务启动（默认 `1`）
 - `SQLITE_DB_PATH`：SQLite 文件路径（默认 `./data/pulseforge.db`）
 - `SQLITE_RETENTION_DAYS`：历史保留天数（默认 `7`）
 - `HISTORY_QUERY_LIMIT_MAX`：历史查询最大返回点数（默认 `500000`）
@@ -140,6 +143,14 @@ npm run smoke
 - `DINGTALK_WEBHOOK_URL`：钉钉机器人 webhook
 - `DINGTALK_SECRET`：钉钉加签 secret（可选）
 - `NOTIFIER_TIMEOUT_MS`：通知通道请求超时（默认 `5000`）
+- `AI_ANALYZER_ENABLED`：是否启用 AI 分析（默认 `1`）
+- `AI_ANALYZER_API_KEY`：AI Provider API Key（可用 `OPENAI_API_KEY` 兼容）
+- `AI_ANALYZER_BASE_URL`：AI API 地址（默认 `https://api.openai.com/v1`）
+- `AI_ANALYZER_MODEL`：模型名（默认 `gpt-4o-mini`）
+- `AI_ANALYZER_TIMEOUT_MS`：AI 请求超时（默认 `8000`）
+- `AI_ANALYZER_MAX_INPUT_CHARS`：AI 输入裁剪上限（默认 `12000`）
+- `AI_ANALYZER_MAX_CONCURRENCY`：AI 分析并发上限（默认 `2`）
+- `AI_ANALYZER_QUEUE_LIMIT`：AI 分析队列上限（默认 `1200`）
 
 Agent 端常用环境变量：
 
@@ -162,6 +173,7 @@ set PORT=4600 && set SAMPLE_RATE_MS=500 && npm start
 ## HTTP API
 
 - `GET /api/health`：健康状态
+- `GET /api/storage/status`：持久化状态（是否降级/错误原因）
 - `GET /api/hosts`：主机列表（本机 + Agent）
 - `GET /api/meta?hostId=...`：指定主机元信息 + 采样配置
 - `GET /api/config`：当前采样配置
@@ -170,6 +182,8 @@ set PORT=4600 && set SAMPLE_RATE_MS=500 && npm start
 - `GET /api/history?hostId=...&minutes=5&limit=600&source=auto`：指定主机历史
 - `GET /api/history/replay?hostId=...&minutes=60&replayStepMs=2000`：趋势回放抽样
 - `GET /api/events?hostId=...&limit=120&source=auto`：指定主机事件
+- `GET /api/events/analysis?hostId=...&eventId=...`：获取/触发单事件 AI 根因分析
+- `POST /api/events/analysis`：触发单事件 AI 根因分析（Body: `hostId,eventId,force`）
 - `GET /api/export.csv?hostId=...&minutes=5`：导出指定主机 CSV
 - `POST /api/agent/ingest`：Agent 上报接口（支持单样本/批量）
 - `GET /api/notifier`：通知通道状态

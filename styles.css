@@ -279,6 +279,10 @@ button:hover {
   grid-column: 1 / -1;
 }
 
+.panel-ai-analysis {
+  grid-column: 1 / -1;
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;
@@ -460,6 +464,88 @@ html[data-theme="dark"] .facts-grid div {
   border: 1px solid var(--panel-border);
   border-radius: 10px;
   padding: 8px 10px;
+  font-size: 13px;
+}
+
+.alert-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.alert-content {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.alert-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+
+.ai-tag {
+  font-size: 11px;
+  color: var(--accent);
+  border: 1px solid rgba(99, 102, 241, 0.45);
+  border-radius: 999px;
+  padding: 2px 6px;
+}
+
+.btn-ai {
+  border: 1px solid rgba(99, 102, 241, 0.5);
+  color: var(--accent);
+  background: rgba(99, 102, 241, 0.08);
+  border-radius: 8px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.btn-ai:hover {
+  background: rgba(99, 102, 241, 0.16);
+}
+
+.ai-analysis-panel {
+  margin-top: 4px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+
+.ai-analysis-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 8px;
+}
+
+.ai-analysis-grid div {
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.ai-analysis-grid dt {
+  font-size: 12px;
+  color: var(--text-sub);
+}
+
+.ai-analysis-grid dd {
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.ai-analysis-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
   font-size: 13px;
 }
 

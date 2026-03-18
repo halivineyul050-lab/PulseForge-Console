@@ -30,7 +30,8 @@ const dom = {
   networkIfaceRows: document.getElementById("networkIfaceRows"),
   processRows: document.getElementById("processRows"),
   alertList: document.getElementById("alertList"),
-  systemFacts: document.getElementById("systemFacts")
+  systemFacts: document.getElementById("systemFacts"),
+  aiAnalysisPanel: document.getElementById("aiAnalysisPanel")
 };
 
 if (typeof echarts === "undefined") {
@@ -201,6 +202,21 @@ const state = {
   alertFlags: {},
   seenEventIds: new Set(),
   seenEventOrder: [],
+  storageStatus: {
+    configured: true,
+    strictStartup: true,
+    ready: false,
+    degraded: false,
+    enabled: false,
+    error: ""
+  },
+  aiAnalyzerStatus: {
+    enabled: false,
+    model: "",
+    providerConfigured: false
+  },
+  selectedEventAnalysis: null,
+  analyzingEventId: "",
   meta: {
     hostName: "HOST-LOCAL",
     os: "Unknown OS",
@@ -463,6 +479,7 @@ function syncHostOptions() {
   }
   saveStoredString(STORAGE_KEYS.selectedHostId, nextHostId);
   updateSampleRateInteractivity();
+  setConnectionUi(state.connectionMode, state.connectionDetail);
 }
 
 function applyHostsPayload(payload) {
@@ -886,7 +903,8 @@ function pushEvents(rawEvents) {
       ts,
       time: String(rawEvent?.time || formatClock(new Date(ts))),
       level,
-      content
+      content,
+      aiAnalysis: rawEvent?.aiAnalysis || null
     });
   }
 
@@ -1122,6 +1140,37 @@ function withHostQuery(pathText, hostId) {
   return `${pathText}${joiner}hostId=${encodeURIComponent(normalizedHostId)}`;
 }
 
+function applyServerStatus(serverPayload) {
+  if (!serverPayload || typeof serverPayload !== "object") {
+    return;
+  }
+
+  if (serverPayload.localHostId) {
+    state.serverLocalHostId = normalizeHostId(serverPayload.localHostId);
+  }
+
+  if (serverPayload.storage && typeof serverPayload.storage === "object") {
+    state.storageStatus = {
+      ...state.storageStatus,
+      ...serverPayload.storage,
+      enabled: Boolean(serverPayload.storage.enabled)
+    };
+  } else if (typeof serverPayload.sqliteEnabled === "boolean") {
+    state.storageStatus = {
+      ...state.storageStatus,
+      enabled: serverPayload.sqliteEnabled,
+      ready: serverPayload.sqliteEnabled
+    };
+  }
+
+  if (serverPayload.aiAnalyzer && typeof serverPayload.aiAnalyzer === "object") {
+    state.aiAnalyzerStatus = {
+      ...state.aiAnalyzerStatus,
+      ...serverPayload.aiAnalyzer
+    };
+  }
+}
+
 async function fetchJson(url, timeoutMs = 4000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1159,8 +1208,8 @@ async function fetchBootstrapData(baseUrl) {
   if (metaData?.meta) {
     applyMeta(metaData.meta);
   }
-  if (metaData?.server?.localHostId) {
-    state.serverLocalHostId = normalizeHostId(metaData.server.localHostId);
+  if (metaData?.server) {
+    applyServerStatus(metaData.server);
     syncHostOptions();
   }
   if (metaData?.config) {
@@ -1174,6 +1223,21 @@ async function fetchBootstrapData(baseUrl) {
   if (Array.isArray(historyData?.points) && historyData.points.length > 0) {
     replaceHistory(historyData.points);
     state.historyLoadedMinutes = state.rangeMinutes;
+  } else if (state.storageStatus.enabled) {
+    const fallbackHistory = await fetchJson(withHostQuery(
+      `${baseUrl}/api/history?minutes=1440&limit=${maxHistoryPoints()}&source=sqlite`,
+      hostId
+    )).catch(() => null);
+
+    if (Array.isArray(fallbackHistory?.points) && fallbackHistory.points.length > 0) {
+      replaceHistory(fallbackHistory.points);
+      state.historyLoadedMinutes = 1440;
+      if (state.rangeMinutes < 60) {
+        state.rangeMinutes = 60;
+        dom.timeRange.value = "60";
+        saveStoredNumber(STORAGE_KEYS.rangeMinutes, state.rangeMinutes);
+      }
+    }
   }
 
   if (Array.isArray(eventsData?.events) && eventsData.events.length > 0) {
@@ -1237,31 +1301,34 @@ function setConnectionUi(mode, detail) {
   const selectedHostId = normalizeHostId(state.selectedHostId);
   const selectedHost = state.hosts.find((host) => host.hostId === selectedHostId);
   const hostLabel = selectedHost?.hostName || state.meta.hostName || "当前主机";
+  const storageHint = state.storageStatus.enabled
+    ? "SQLite持久化"
+    : (state.storageStatus.configured ? "持久化异常" : "仅内存缓存");
 
   if (mode === "live") {
     dom.connectionBadge.textContent = "实时连接";
     dom.connectionBadge.classList.add("pill-online");
-    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 真机采集${detail ? ` · ${detail}` : ""}`;
+    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 真机采集 · ${storageHint}${detail ? ` · ${detail}` : ""}`;
     return;
   }
 
   if (mode === "mock") {
     dom.connectionBadge.textContent = "模拟模式";
     dom.connectionBadge.classList.add("pill-fallback");
-    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 模拟数据${detail ? ` · ${detail}` : ""}`;
+    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 模拟数据 · ${storageHint}${detail ? ` · ${detail}` : ""}`;
     return;
   }
 
   if (mode === "connecting") {
     dom.connectionBadge.textContent = "连接中";
     dom.connectionBadge.classList.add("pill-offline");
-    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 正在连接采集服务`;
+    dom.sourceInfo.textContent = `数据源: ${hostLabel} · 正在连接采集服务 · ${storageHint}`;
     return;
   }
 
   dom.connectionBadge.textContent = "离线";
   dom.connectionBadge.classList.add("pill-offline");
-  dom.sourceInfo.textContent = `数据源: ${hostLabel} · 离线${detail ? ` · ${detail}` : ""}`;
+  dom.sourceInfo.textContent = `数据源: ${hostLabel} · 离线 · ${storageHint}${detail ? ` · ${detail}` : ""}`;
 }
 
 function clearLiveWatchers() {
@@ -1412,8 +1479,8 @@ function handleSocketMessage(rawData) {
   if (message.type === "hello") {
     const payload = message.payload || {};
 
-    if (payload.server?.localHostId) {
-      state.serverLocalHostId = normalizeHostId(payload.server.localHostId);
+    if (payload.server) {
+      applyServerStatus(payload.server);
     }
 
     if (Array.isArray(payload.hosts)) {
@@ -1444,7 +1511,8 @@ function handleSocketMessage(rawData) {
 
     if (Array.isArray(payload.history) && payload.history.length > 0) {
       replaceHistory(payload.history);
-      state.historyLoadedMinutes = Math.min(state.rangeMinutes, 5);
+      const bootstrapMinutes = numberOr(payload.server?.bootstrapHistoryMinutes, 5);
+      state.historyLoadedMinutes = Math.max(1, Math.min(state.rangeMinutes, bootstrapMinutes));
     } else {
       resetHistory();
     }
@@ -1468,6 +1536,7 @@ function handleSocketMessage(rawData) {
     }
 
     updateSampleRateInteractivity();
+    setConnectionUi(state.connectionMode, state.connectionDetail);
     if (!state.frozen) {
       requestRender();
     }
@@ -1920,7 +1989,11 @@ function renderAlerts() {
     dom.alertList.innerHTML = state.alerts.slice(0, 16).map((item) => {
       const levelLabel = item.level === "danger" ? "危险" : item.level === "warn" ? "警告" : "恢复";
       const levelClass = item.level === "danger" ? "level-danger" : item.level === "warn" ? "level-warn" : "level-info";
-      return `<li class="alert-item ${levelClass}"><span>${item.content}</span><span class="alert-level">${levelLabel}</span><span class="alert-time">${item.time}</span></li>`;
+      const hasAiAnalysis = Boolean(item.aiAnalysis || (state.selectedEventAnalysis && state.selectedEventAnalysis.eventId === item.id));
+      const aiTag = hasAiAnalysis ? `<span class="ai-tag">已分析</span>` : "";
+      const loading = state.analyzingEventId === item.id;
+      const buttonText = loading ? "分析中..." : "AI分析";
+      return `<li class="alert-item ${levelClass}"><div class="alert-main"><span class="alert-content">${item.content}</span>${aiTag}</div><div class="alert-actions"><span class="alert-level">${levelLabel}</span><button class="btn-ai" data-action="ai-analyze" data-event-id="${item.id}" ${loading ? "disabled" : ""}>${buttonText}</button><span class="alert-time">${item.time}</span></div></li>`;
     }).join("");
   }
 
@@ -1933,6 +2006,46 @@ function renderAlerts() {
     dom.alertBadge.style.color = cssVar("--text-sub");
     dom.alertBadge.style.borderColor = cssVar("--panel-border");
   }
+}
+
+function renderAiAnalysisPanel() {
+  if (!dom.aiAnalysisPanel) {
+    return;
+  }
+
+  if (state.analyzingEventId) {
+    dom.aiAnalysisPanel.innerHTML = `<div class="empty-note">正在分析事件 ${state.analyzingEventId}，请稍候...</div>`;
+    return;
+  }
+
+  const selected = state.selectedEventAnalysis;
+  if (!selected || !selected.analysis) {
+    dom.aiAnalysisPanel.innerHTML = `<div class="empty-note">点击事件时间线中的“AI分析”开始诊断。</div>`;
+    return;
+  }
+
+  const analysis = selected.analysis;
+  const cause = analysis.cause || {};
+  const remediation = analysis.remediation || {};
+  const immediate = Array.isArray(remediation.immediate) ? remediation.immediate : [];
+  const next24h = Array.isArray(remediation.next24h) ? remediation.next24h : [];
+  const prevention = Array.isArray(remediation.prevention) ? remediation.prevention : [];
+  const confidence = Number.isFinite(Number(cause.confidence)) ? `${Math.round(Number(cause.confidence) * 100)}%` : "--";
+
+  dom.aiAnalysisPanel.innerHTML = `
+    <div class="ai-analysis-grid">
+      <div><dt>事件ID</dt><dd>${selected.eventId || "--"}</dd></div>
+      <div><dt>模型</dt><dd>${selected.model || analysis.model || "--"}</dd></div>
+      <div><dt>状态</dt><dd>${analysis.status || selected.status || "--"}</dd></div>
+      <div><dt>置信度</dt><dd>${confidence}</dd></div>
+      <div><dt>分类</dt><dd>${cause.category || "unknown"}</dd></div>
+      <div><dt>组件</dt><dd>${cause.affectedComponent || "unknown"}</dd></div>
+    </div>
+    <div><strong>根因摘要：</strong> ${cause.summary || "暂无"}</div>
+    <div><strong>立即处理：</strong><ul class="ai-analysis-list">${immediate.map((item) => `<li>${item}</li>`).join("") || "<li>暂无</li>"}</ul></div>
+    <div><strong>24小时内：</strong><ul class="ai-analysis-list">${next24h.map((item) => `<li>${item}</li>`).join("") || "<li>暂无</li>"}</ul></div>
+    <div><strong>预防建议：</strong><ul class="ai-analysis-list">${prevention.map((item) => `<li>${item}</li>`).join("") || "<li>暂无</li>"}</ul></div>
+  `;
 }
 
 function renderSystemFacts() {
@@ -1964,12 +2077,20 @@ function renderSystemFacts() {
   const selectedHostSource = selectedHost ? hostSourceLabel(selectedHost.source) : (isViewingLocalHost() ? "本机" : "unknown");
   const selectedHostStatus = selectedHost ? (selectedHost.online ? "在线" : "离线") : "未知";
   const selectedHostAlerts = selectedHost ? `${selectedHost.activeAlertCount}` : "--";
+  const storageStatusText = state.storageStatus.enabled
+    ? "SQLite 已启用"
+    : (state.storageStatus.error ? `异常: ${state.storageStatus.error}` : "未启用");
+  const aiStatusText = state.aiAnalyzerStatus.enabled
+    ? (state.aiAnalyzerStatus.providerConfigured ? `已启用(${state.aiAnalyzerStatus.model || "default"})` : "已启用(本地回退)")
+    : "已关闭";
 
   const facts = [
     ["主机 ID", selectedHostId],
     ["主机来源", selectedHostSource],
     ["主机在线", selectedHostStatus],
     ["主机告警", selectedHostAlerts],
+    ["数据持久化", storageStatusText],
+    ["AI 分析", aiStatusText],
     ["操作系统", state.meta.os || "Unknown"],
     ["CPU 型号", state.meta.cpuModel || "Unknown"],
     ["核心数量", `${state.meta.physicalCores || "-"}P / ${state.meta.logicalCores || state.coreLoads.length}L`],
@@ -2439,6 +2560,7 @@ function renderAll() {
   renderNetworkInterfaceTable();
   renderProcessTable();
   renderAlerts();
+  renderAiAnalysisPanel();
   renderSystemFacts();
   renderCharts();
 }
@@ -2637,6 +2759,8 @@ function resetHostScopedViewState() {
   state.alertFlags = {};
   state.seenEventIds.clear();
   state.seenEventOrder = [];
+  state.selectedEventAnalysis = null;
+  state.analyzingEventId = "";
   state.selectedNetworkIface = "__ALL__";
   dom.networkIfaceSelect.value = "__ALL__";
 }
@@ -2680,6 +2804,79 @@ function handleHostChange() {
   requestRender(true);
 }
 
+function applyEventAiAnalysisRecord(record) {
+  if (!record || !record.eventId) {
+    return;
+  }
+
+  for (const item of state.alerts) {
+    if (item.id === record.eventId) {
+      item.aiAnalysis = record;
+      break;
+    }
+  }
+
+  state.selectedEventAnalysis = record;
+}
+
+async function requestEventAiAnalysis(eventId, force = false) {
+  if (!eventId) {
+    return;
+  }
+
+  state.analyzingEventId = eventId;
+  renderAiAnalysisPanel();
+
+  try {
+    const baseUrl = getServerBaseUrl();
+    const hostId = selectedHostForQuery();
+    const url = withHostQuery(`${baseUrl}/api/events/analysis?eventId=${encodeURIComponent(eventId)}&force=${force ? "1" : "0"}`, hostId);
+    const payload = await fetchJson(url, 12000);
+    if (payload?.analysis) {
+      applyEventAiAnalysisRecord(payload.analysis);
+    }
+  } catch (error) {
+    state.selectedEventAnalysis = {
+      eventId,
+      model: state.aiAnalyzerStatus.model || "local",
+      status: "error",
+      analysis: {
+        status: "error",
+        cause: {
+          summary: `AI 分析失败：${error.message || "未知错误"}`,
+          category: "unknown",
+          affectedComponent: "unknown",
+          confidence: 0
+        },
+        remediation: {
+          immediate: ["稍后重试，或检查 AI_ANALYZER_API_KEY 与网络连通性"],
+          next24h: [],
+          prevention: []
+        }
+      }
+    };
+  } finally {
+    state.analyzingEventId = "";
+    requestRender(true);
+  }
+}
+
+function handleAlertListClick(event) {
+  const button = event.target.closest("button[data-action='ai-analyze']");
+  if (!button) {
+    return;
+  }
+
+  const eventId = String(button.dataset.eventId || "").trim();
+  if (!eventId) {
+    return;
+  }
+
+  requestEventAiAnalysis(eventId).catch(() => {
+    // handled inside requestEventAiAnalysis
+  });
+}
+
 function handleNetworkIfaceChange() {
   const value = String(dom.networkIfaceSelect.value || "__ALL__");
   state.selectedNetworkIface = value;
@@ -2697,6 +2894,9 @@ function bindEvents() {
   dom.exportCsvBtn.addEventListener("click", handleExportCsv);
   dom.reconnectBtn.addEventListener("click", handleReconnectClick);
   dom.networkIfaceSelect.addEventListener("change", handleNetworkIfaceChange);
+  if (dom.alertList) {
+    dom.alertList.addEventListener("click", handleAlertListClick);
+  }
 
   window.addEventListener("resize", () => {
     for (const chart of Object.values(charts)) {

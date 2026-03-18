@@ -72,6 +72,18 @@ class SqliteStore {
       );
 
       CREATE INDEX IF NOT EXISTS idx_events_host_ts ON events(host_id, ts DESC);
+
+      CREATE TABLE IF NOT EXISTS event_analyses (
+        event_id TEXT PRIMARY KEY,
+        host_id TEXT NOT NULL,
+        event_ts INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        model TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_event_analyses_host_ts ON event_analyses(host_id, event_ts DESC);
     `);
 
     this.statements = {
@@ -126,6 +138,29 @@ class SqliteStore {
         ORDER BY ts DESC
         LIMIT ?
       `),
+      selectEventById: this.db.prepare(`
+        SELECT event_json
+        FROM events
+        WHERE host_id = ? AND id = ?
+        LIMIT 1
+      `),
+      upsertEventAnalysis: this.db.prepare(`
+        INSERT INTO event_analyses(event_id, host_id, event_ts, status, model, analysis_json, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(event_id) DO UPDATE SET
+          host_id = excluded.host_id,
+          event_ts = excluded.event_ts,
+          status = excluded.status,
+          model = excluded.model,
+          analysis_json = excluded.analysis_json,
+          updated_at = excluded.updated_at
+      `),
+      selectEventAnalysis: this.db.prepare(`
+        SELECT event_id, host_id, event_ts, status, model, analysis_json, updated_at
+        FROM event_analyses
+        WHERE event_id = ?
+        LIMIT 1
+      `),
       deleteOldSamples: this.db.prepare(`
         DELETE FROM samples
         WHERE ts < ?
@@ -133,6 +168,10 @@ class SqliteStore {
       deleteOldEvents: this.db.prepare(`
         DELETE FROM events
         WHERE ts < ?
+      `),
+      deleteOldEventAnalyses: this.db.prepare(`
+        DELETE FROM event_analyses
+        WHERE event_ts < ?
       `)
     };
 
@@ -194,6 +233,7 @@ class SqliteStore {
     const cutoff = nowTs - retentionMs;
     this.statements.deleteOldSamples.run(cutoff);
     this.statements.deleteOldEvents.run(cutoff);
+    this.statements.deleteOldEventAnalyses.run(cutoff);
     this.lastPruneTs = nowTs;
   }
 
@@ -248,6 +288,48 @@ class SqliteStore {
       safeLimit
     );
     return rows.map((row) => safeJsonParse(row.event_json, null)).filter(Boolean);
+  }
+
+  getEventById(hostId, eventId) {
+    const row = this.statements.selectEventById.get(String(hostId), String(eventId));
+    if (!row) {
+      return null;
+    }
+    return safeJsonParse(row.event_json, null);
+  }
+
+  upsertEventAnalysis(record) {
+    if (!record || !record.eventId) {
+      return;
+    }
+
+    const updatedAt = Number(record.updatedAt || Date.now());
+    this.statements.upsertEventAnalysis.run(
+      String(record.eventId),
+      String(record.hostId || "unknown"),
+      Number(record.eventTs || 0),
+      String(record.status || "fallback"),
+      String(record.model || "none"),
+      JSON.stringify(record.analysis || {}),
+      updatedAt
+    );
+  }
+
+  getEventAnalysis(eventId) {
+    const row = this.statements.selectEventAnalysis.get(String(eventId));
+    if (!row) {
+      return null;
+    }
+
+    return {
+      eventId: row.event_id,
+      hostId: row.host_id,
+      eventTs: Number(row.event_ts || 0),
+      status: String(row.status || "fallback"),
+      model: String(row.model || "none"),
+      analysis: safeJsonParse(row.analysis_json, {}),
+      updatedAt: Number(row.updated_at || 0)
+    };
   }
 
   getSamples(hostId, { fromTs = 0, toTs = Number.MAX_SAFE_INTEGER, limit = 20000 } = {}) {

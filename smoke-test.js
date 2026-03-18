@@ -135,6 +135,12 @@ async function runSmokeTest() {
   try {
     const health = await waitForHealth();
     assert(health.ok, "Health endpoint did not return ok=true");
+    assert(typeof health.storage?.configured === "boolean", "Health missing storage.configured");
+    assert(typeof health.storage?.enabled === "boolean", "Health missing storage.enabled");
+
+    const storageStatus = await fetchJson(`${BASE_URL}/api/storage/status`);
+    assert(typeof storageStatus.configured === "boolean", "Storage status missing configured");
+    assert(typeof storageStatus.strictStartup === "boolean", "Storage status missing strictStartup");
 
     const hostsInitial = await fetchJson(`${BASE_URL}/api/hosts`);
     assert(Array.isArray(hostsInitial.hosts), "Missing hosts list");
@@ -223,7 +229,15 @@ async function runSmokeTest() {
           temp: 51,
           tempEstimated: false,
           processTop: [{ name: "smoke.exe", cpu: 2.1, memoryMb: 120 }]
-        }
+        },
+        events: [{
+          id: `smoke-event-${Date.now()}`,
+          key: "cpuHigh",
+          level: "warn",
+          type: "trigger",
+          content: "Smoke injected event",
+          ts: Date.now()
+        }]
       })
     });
     assert(ingestResult.ok, "Agent ingest failed");
@@ -238,6 +252,18 @@ async function runSmokeTest() {
     const remoteReplay = await fetchJson(`${BASE_URL}/api/history/replay?hostId=${encodeURIComponent(remoteHostId)}&minutes=5&replayStepMs=2000&source=auto`);
     assert(Array.isArray(remoteReplay.points), "Remote replay points is not an array");
     assert(Number(remoteReplay.replayStepMs) >= 100, "Replay stepMs missing");
+
+    const remoteEvents = await fetchJson(`${BASE_URL}/api/events?hostId=${encodeURIComponent(remoteHostId)}&minutes=30&limit=20&source=auto`);
+    assert(Array.isArray(remoteEvents.events), "Remote events is not an array");
+    assert(remoteEvents.events.length >= 1, "Remote events missing injected event");
+    assert(remoteEvents.events[0].aiAnalysis !== undefined, "Remote event missing aiAnalysis field");
+
+    const eventId = String(remoteEvents.events[0].id || "");
+    assert(eventId.length > 0, "Remote event missing id");
+
+    const analysis = await fetchJson(`${BASE_URL}/api/events/analysis?hostId=${encodeURIComponent(remoteHostId)}&eventId=${encodeURIComponent(eventId)}`);
+    assert(analysis.ok, "Event AI analysis request failed");
+    assert(analysis.analysis?.analysis?.cause?.summary, "Event AI analysis missing cause summary");
 
     const hostsAfterIngest = await fetchJson(`${BASE_URL}/api/hosts`);
     assert(hostsAfterIngest.hosts.some((host) => host.hostId === remoteHostId), "Remote host missing from host list");
