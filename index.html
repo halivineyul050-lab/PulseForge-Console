@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PulseForge - 电脑实时性能监控</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+SC:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+</head>
+<body>
+  <div class="background-layer" aria-hidden="true"></div>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand-block">
+        <p class="brand-eyebrow">实时系统监控</p>
+        <h1 class="brand-title">PulseForge Console</h1>
+      </div>
+
+      <div class="host-block">
+        <p id="hostName">HOST-LOCAL</p>
+        <p id="systemInfo">Windows 11 · 12 Core · 32GB RAM</p>
+        <p id="sourceInfo" class="source-info">数据源: 初始化中</p>
+      </div>
+
+      <div class="control-block">
+        <label>
+          主机
+          <select id="hostSelect">
+            <option value="">当前主机</option>
+          </select>
+        </label>
+
+        <label>
+          采样
+          <select id="sampleRate">
+            <option value="500">500ms</option>
+            <option value="1000" selected>1s</option>
+            <option value="2000">2s</option>
+          </select>
+        </label>
+
+        <label>
+          范围
+          <select id="timeRange">
+            <option value="1">1m</option>
+            <option value="5" selected>5m</option>
+            <option value="15">15m</option>
+            <option value="60">1h</option>
+          </select>
+        </label>
+
+        <button id="themeToggle" class="ghost-btn" type="button">夜间模式</button>
+        <button id="freezeToggle" class="solid-btn" type="button">冻结画面</button>
+        <button id="exportCsvBtn" class="ghost-btn" type="button">导出 CSV</button>
+        <button id="reconnectBtn" class="ghost-btn" type="button">重连数据源</button>
+      </div>
+
+      <div class="status-block">
+        <p id="clock">--:--:--</p>
+        <p>
+          <span id="connectionBadge" class="status-pill">连接中</span>
+          <span id="alertBadge" class="status-pill">告警 0</span>
+        </p>
+      </div>
+    </header>
+
+    <section class="kpi-grid" aria-label="核心指标">
+      <article class="kpi-card">
+        <p class="kpi-label">CPU 占用</p>
+        <p class="kpi-value mono" id="cpuValue">--%</p>
+        <p class="kpi-sub" id="cpuSub">频率 -- GHz</p>
+      </article>
+      <article class="kpi-card">
+        <p class="kpi-label">内存占用</p>
+        <p class="kpi-value mono" id="memValue">--%</p>
+        <p class="kpi-sub" id="memSub">-- / -- GB</p>
+      </article>
+      <article class="kpi-card">
+        <p class="kpi-label">GPU 负载</p>
+        <p class="kpi-value mono" id="gpuValue">--%</p>
+        <p class="kpi-sub" id="gpuSub">显存 -- / -- GB</p>
+      </article>
+      <article class="kpi-card">
+        <p class="kpi-label">磁盘活动</p>
+        <p class="kpi-value mono" id="diskValue">-- MB/s</p>
+        <p class="kpi-sub" id="diskSub">延迟 -- ms</p>
+      </article>
+      <article class="kpi-card">
+        <p class="kpi-label">网络吞吐</p>
+        <p class="kpi-value mono" id="netValue">↑ -- / ↓ --</p>
+        <p class="kpi-sub" id="netSub">连接数 --</p>
+      </article>
+      <article class="kpi-card">
+        <p class="kpi-label">核心温度</p>
+        <p class="kpi-value mono" id="tempValue">-- °C</p>
+        <p class="kpi-sub" id="tempSub">状态 --</p>
+      </article>
+    </section>
+
+    <main class="dashboard-grid">
+      <section class="panel panel-cpu">
+        <div class="panel-header">
+          <h2>CPU 总览</h2>
+          <span class="panel-tag">总负载 + 频率</span>
+        </div>
+        <div id="cpuChart" class="chart-box"></div>
+        <div class="core-wrap">
+          <p>每核心热力分布</p>
+          <div id="coreHeatmap" class="core-grid"></div>
+        </div>
+      </section>
+
+      <section class="panel panel-memory">
+        <div class="panel-header">
+          <h2>内存与交换</h2>
+          <span class="panel-tag">RAM + Swap</span>
+        </div>
+        <div id="memoryChart" class="chart-box"></div>
+      </section>
+
+      <section class="panel panel-gpu">
+        <div class="panel-header">
+          <h2>GPU 状态</h2>
+          <span class="panel-tag">利用率 + 温度</span>
+        </div>
+        <div id="gpuChart" class="chart-box"></div>
+      </section>
+
+      <section class="panel panel-system">
+        <div class="panel-header">
+          <h2>系统快照</h2>
+          <span class="panel-tag">设备/驱动/数据质量</span>
+        </div>
+        <dl id="systemFacts" class="facts-grid"></dl>
+      </section>
+
+      <section class="panel panel-disk">
+        <div class="panel-header">
+          <h2>磁盘 IO</h2>
+          <span class="panel-tag">读写 + 延迟</span>
+        </div>
+        <div id="diskChart" class="chart-box"></div>
+        <div class="panel-header panel-subheader">
+          <h3>分盘符吞吐</h3>
+          <span class="panel-tag">每盘独立曲线</span>
+        </div>
+        <div id="diskVolumeChart" class="chart-box chart-box-sm"></div>
+        <table class="process-table process-table-compact">
+          <thead>
+            <tr>
+              <th>盘符</th>
+              <th>读取 MB/s</th>
+              <th>写入 MB/s</th>
+              <th>总吞吐 MB/s</th>
+            </tr>
+          </thead>
+          <tbody id="diskVolumeRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel panel-network">
+        <div class="panel-header">
+          <h2>网络流量</h2>
+          <span class="panel-tag">上行 + 下行</span>
+        </div>
+        <div class="network-toolbar">
+          <label>
+            网卡
+            <select id="networkIfaceSelect">
+              <option value="__ALL__">全部网卡</option>
+            </select>
+          </label>
+        </div>
+        <div id="networkChart" class="chart-box"></div>
+        <table class="process-table process-table-compact">
+          <thead>
+            <tr>
+              <th>网卡</th>
+              <th>上行</th>
+              <th>下行</th>
+              <th>总速率</th>
+            </tr>
+          </thead>
+          <tbody id="networkIfaceRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel panel-process">
+        <div class="panel-header">
+          <h2>进程 Top 5</h2>
+          <span class="panel-tag">内存占用</span>
+        </div>
+        <table class="process-table">
+          <thead>
+            <tr>
+              <th>进程</th>
+              <th>CPU%</th>
+              <th>内存 MB</th>
+            </tr>
+          </thead>
+          <tbody id="processRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel panel-alert">
+        <div class="panel-header">
+          <h2>事件时间线</h2>
+          <span class="panel-tag">异常与恢复记录</span>
+        </div>
+        <ul id="alertList" class="alert-list"></ul>
+      </section>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

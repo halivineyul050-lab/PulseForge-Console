@@ -1,0 +1,20 @@
+{
+  "name": "pulseforge-console",
+  "version": "2.0.0",
+  "private": true,
+  "description": "PulseForge 实时电脑性能可视化监控台",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "agent": "node agent.js",
+    "check": "node --check server.js && node --check app.js && node --check agent.js && node --check smoke-test.js",
+    "smoke": "node smoke-test.js"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "express": "^4.21.2",
+    "systeminformation": "^5.27.11",
+    "ws": "^8.18.3"
+  }
+}
