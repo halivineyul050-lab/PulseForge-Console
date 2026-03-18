@@ -43,10 +43,18 @@ const AI_ANALYZER_MAX_CONCURRENCY = Math.max(1, Number(process.env.AI_ANALYZER_M
 const AI_ANALYZER_QUEUE_LIMIT = Math.max(100, Number(process.env.AI_ANALYZER_QUEUE_LIMIT || 1200));
 
 const NOTIFIER_TIMEOUT_MS = Number(process.env.NOTIFIER_TIMEOUT_MS || 5000);
+const NOTIFIER_RETRY_MAX_ATTEMPTS = Math.max(1, Number(process.env.NOTIFIER_RETRY_MAX_ATTEMPTS || 3));
+const NOTIFIER_RETRY_BASE_DELAY_MS = Math.max(100, Number(process.env.NOTIFIER_RETRY_BASE_DELAY_MS || 250));
+const NOTIFIER_RETRY_MAX_DELAY_MS = Math.max(NOTIFIER_RETRY_BASE_DELAY_MS, Number(process.env.NOTIFIER_RETRY_MAX_DELAY_MS || 2000));
 const ALERT_WEBHOOK_URL = process.env.ALERT_WEBHOOK_URL;
 const WECHAT_WEBHOOK_URL = process.env.WECHAT_WEBHOOK_URL;
 const DINGTALK_WEBHOOK_URL = process.env.DINGTALK_WEBHOOK_URL;
 const DINGTALK_SECRET = process.env.DINGTALK_SECRET;
+
+const SQLITE_BUSY_TIMEOUT_MS = Math.max(100, Number(process.env.SQLITE_BUSY_TIMEOUT_MS || 4000));
+const STORAGE_WRITE_RETRY_MAX_ATTEMPTS = Math.max(1, Number(process.env.STORAGE_WRITE_RETRY_MAX_ATTEMPTS || 4));
+const STORAGE_WRITE_RETRY_BASE_DELAY_MS = Math.max(20, Number(process.env.STORAGE_WRITE_RETRY_BASE_DELAY_MS || 80));
+const STORAGE_WRITE_RETRY_MAX_DELAY_MS = Math.max(STORAGE_WRITE_RETRY_BASE_DELAY_MS, Number(process.env.STORAGE_WRITE_RETRY_MAX_DELAY_MS || 1200));
 
 const LOCAL_HOST_ID = sanitizeHostId(`local:${os.hostname()}`);
 
@@ -141,6 +149,14 @@ const aiAnalysisQueue = [];
 let aiAnalysisInFlight = 0;
 const analysisNotifyState = new Map();
 
+const reliabilityStats = {
+  storageRetryScheduled: 0,
+  storageRetrySucceeded: 0,
+  storageRetryExhausted: 0,
+  analysisQueueDropped: 0,
+  analysisQueueRejects: 0
+};
+
 const storageStatus = {
   configured: SQLITE_ENABLED,
   strictStartup: SQLITE_STRICT_STARTUP,
@@ -167,7 +183,10 @@ const notifier = new AlertNotifier({
   wechatWebhookUrl: WECHAT_WEBHOOK_URL,
   dingtalkWebhookUrl: DINGTALK_WEBHOOK_URL,
   dingtalkSecret: DINGTALK_SECRET,
-  timeoutMs: NOTIFIER_TIMEOUT_MS
+  timeoutMs: NOTIFIER_TIMEOUT_MS,
+  retryMaxAttempts: NOTIFIER_RETRY_MAX_ATTEMPTS,
+  retryBaseDelayMs: NOTIFIER_RETRY_BASE_DELAY_MS,
+  retryMaxDelayMs: NOTIFIER_RETRY_MAX_DELAY_MS
 });
 
 const ALERT_RULES = [
@@ -1883,6 +1902,18 @@ function collectorStatsPayload() {
   };
 }
 
+function isSqliteBusyError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("database is locked")
+    || message.includes("sqlite_busy")
+    || message.includes("busy");
+}
+
+function storageWriteRetryDelayMs(attempt) {
+  const exponential = STORAGE_WRITE_RETRY_BASE_DELAY_MS * (2 ** Math.max(0, attempt - 1));
+  return Math.min(STORAGE_WRITE_RETRY_MAX_DELAY_MS, exponential);
+}
+
 function persistHostSnapshotToStorage(hostSnapshot) {
   if (!storage || !hostSnapshot) {
     return;
@@ -1898,11 +1929,33 @@ function persistHostSnapshotToStorage(hostSnapshot) {
       lastSeenTs: hostSnapshot.lastSeenTs
     });
   } catch (error) {
+    if (isSqliteBusyError(error)) {
+      const delay = storageWriteRetryDelayMs(1);
+      setTimeout(() => {
+        try {
+          storage?.persistHostSnapshot({
+            hostId: hostSnapshot.hostId,
+            hostName: hostSnapshot.hostName,
+            source: hostSnapshot.source,
+            meta: hostSnapshot.meta,
+            firstSeenTs: hostSnapshot.firstSeenTs,
+            lastSeenTs: hostSnapshot.lastSeenTs
+          });
+        } catch (retryError) {
+          console.warn(`[storage] retry host snapshot failed: ${retryError.message}`);
+        }
+      }, delay).unref?.();
+      return;
+    }
+
     console.warn(`[storage] persist host snapshot failed: ${error.message}`);
   }
 }
 
-function persistSampleBundleToStorage({ hostId, hostName, source, hostMeta, firstSeenTs, sample, events = [] }) {
+function persistSampleBundleToStorage({ hostId, hostName, source, hostMeta, firstSeenTs, sample, events = [] }, options = {}) {
+  const attempt = Number(options.attempt || 1);
+  const allowRetry = options.allowRetry !== false;
+
   if (!storage || !sample) {
     return;
   }
@@ -1917,7 +1970,35 @@ function persistSampleBundleToStorage({ hostId, hostName, source, hostMeta, firs
       sample,
       events
     });
+
+    if (attempt > 1) {
+      reliabilityStats.storageRetrySucceeded += 1;
+    }
   } catch (error) {
+    if (allowRetry && isSqliteBusyError(error) && attempt < STORAGE_WRITE_RETRY_MAX_ATTEMPTS) {
+      reliabilityStats.storageRetryScheduled += 1;
+      const delay = storageWriteRetryDelayMs(attempt);
+      setTimeout(() => {
+        persistSampleBundleToStorage({
+          hostId,
+          hostName,
+          source,
+          hostMeta,
+          firstSeenTs,
+          sample,
+          events
+        }, {
+          attempt: attempt + 1,
+          allowRetry: true
+        });
+      }, delay).unref?.();
+      return;
+    }
+
+    if (isSqliteBusyError(error)) {
+      reliabilityStats.storageRetryExhausted += 1;
+    }
+
     console.warn(`[storage] persist sample failed: ${error.message}`);
   }
 }
@@ -1988,8 +2069,24 @@ function storageStatusPayload() {
     enabled: storageStatus.ready && Boolean(storage),
     dbPath: storageStatus.dbPath,
     retentionDays: storageStatus.retentionDays,
+    busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS,
+    writeRetry: {
+      maxAttempts: STORAGE_WRITE_RETRY_MAX_ATTEMPTS,
+      baseDelayMs: STORAGE_WRITE_RETRY_BASE_DELAY_MS,
+      maxDelayMs: STORAGE_WRITE_RETRY_MAX_DELAY_MS
+    },
     initializedAt: storageStatus.initializedAt || 0,
     error: storageStatus.error || ""
+  };
+}
+
+function reliabilityStatusPayload() {
+  return {
+    ...reliabilityStats,
+    aiQueue: aiAnalysisQueueStatusPayload(),
+    notifier: typeof notifier.getStats === "function"
+      ? notifier.getStats()
+      : null
   };
 }
 
@@ -2220,6 +2317,59 @@ function markEventAnalysisPending({ hostId, eventId, eventTs }) {
   saveEventAiAnalysisToCache(normalizedEventId, pendingRecord);
 }
 
+function markEventAnalysisDropped({ hostId, eventId, eventTs }) {
+  const normalizedEventId = String(eventId || "").trim();
+  if (!normalizedEventId) {
+    return null;
+  }
+
+  const droppedRecord = {
+    eventId: normalizedEventId,
+    hostId: resolveHostIdFromInput(hostId),
+    eventTs: safeTimestamp(eventTs, Date.now()),
+    status: "dropped",
+    model: aiAnalyzer.model,
+    analysis: {
+      status: "dropped",
+      cause: {
+        summary: "AI 分析队列已满，自动分析已跳过，可稍后手动重试。",
+        category: "queue_overflow",
+        affectedComponent: "ai-analysis",
+        confidence: 0
+      },
+      evidence: [],
+      remediation: {
+        immediate: ["稍后手动触发该事件 AI 分析"],
+        next24h: ["提高 AI_ANALYZER_MAX_CONCURRENCY 或降低事件分析触发频率"],
+        prevention: ["根据峰值流量调整 AI_ANALYZER_QUEUE_LIMIT"]
+      },
+      meta: {
+        fallbackReason: "analysis_queue_full"
+      }
+    },
+    updatedAt: Date.now()
+  };
+
+  persistEventAiAnalysisToStorage(droppedRecord);
+  saveEventAiAnalysisToCache(normalizedEventId, droppedRecord);
+  return droppedRecord;
+}
+
+function aiAnalysisQueueStatusPayload() {
+  return {
+    inFlight: aiAnalysisInFlight,
+    maxConcurrency: AI_ANALYZER_MAX_CONCURRENCY,
+    queued: aiAnalysisQueue.length,
+    queueLimit: AI_ANALYZER_QUEUE_LIMIT,
+    pendingSet: pendingEventAnalyses.size
+  };
+}
+
+function isAiAnalysisQueueSaturated() {
+  return aiAnalysisQueue.length >= AI_ANALYZER_QUEUE_LIMIT
+    && aiAnalysisInFlight >= AI_ANALYZER_MAX_CONCURRENCY;
+}
+
 function pumpAiAnalysisQueue() {
   while (aiAnalysisInFlight < AI_ANALYZER_MAX_CONCURRENCY && aiAnalysisQueue.length > 0) {
     const task = aiAnalysisQueue.shift();
@@ -2261,13 +2411,16 @@ function enqueueEventAnalysis(task) {
   }
 
   if (aiAnalysisQueue.length >= AI_ANALYZER_QUEUE_LIMIT) {
-    return;
+    reliabilityStats.analysisQueueDropped += 1;
+    markEventAnalysisDropped(task);
+    return false;
   }
 
   pendingEventAnalyses.add(eventId);
   markEventAnalysisPending(task);
   aiAnalysisQueue.push(task);
   pumpAiAnalysisQueue();
+  return true;
 }
 
 function analyzeEventsAsync(hostId, events, sample = null) {
@@ -2621,8 +2774,15 @@ app.get("/api/health", (req, res) => {
       providerConfigured: aiAnalyzer.providerConfigured
     },
     notifier: {
-      enabled: notifier.enabled
-    }
+      enabled: notifier.enabled,
+      retry: {
+        maxAttempts: NOTIFIER_RETRY_MAX_ATTEMPTS,
+        baseDelayMs: NOTIFIER_RETRY_BASE_DELAY_MS,
+        maxDelayMs: NOTIFIER_RETRY_MAX_DELAY_MS
+      }
+    },
+    aiQueue: aiAnalysisQueueStatusPayload(),
+    reliability: reliabilityStatusPayload()
   });
 });
 
@@ -2634,12 +2794,18 @@ app.get("/api/notifier", (req, res) => {
   res.json({
     enabled: notifier.enabled,
     timeoutMs: NOTIFIER_TIMEOUT_MS,
+    retry: {
+      maxAttempts: NOTIFIER_RETRY_MAX_ATTEMPTS,
+      baseDelayMs: NOTIFIER_RETRY_BASE_DELAY_MS,
+      maxDelayMs: NOTIFIER_RETRY_MAX_DELAY_MS
+    },
     channels: {
       webhook: Boolean(ALERT_WEBHOOK_URL),
       wechat: Boolean(WECHAT_WEBHOOK_URL),
       dingtalk: Boolean(DINGTALK_WEBHOOK_URL),
       dingtalkSigned: Boolean(DINGTALK_WEBHOOK_URL && DINGTALK_SECRET)
-    }
+    },
+    stats: typeof notifier.getStats === "function" ? notifier.getStats() : null
   });
 });
 
@@ -2823,12 +2989,21 @@ app.get("/api/diagnostics", (req, res) => {
     },
     notifier: {
       enabled: notifier.enabled,
+      timeoutMs: NOTIFIER_TIMEOUT_MS,
+      retry: {
+        maxAttempts: NOTIFIER_RETRY_MAX_ATTEMPTS,
+        baseDelayMs: NOTIFIER_RETRY_BASE_DELAY_MS,
+        maxDelayMs: NOTIFIER_RETRY_MAX_DELAY_MS
+      },
       channels: {
         webhook: Boolean(ALERT_WEBHOOK_URL),
         wechat: Boolean(WECHAT_WEBHOOK_URL),
         dingtalk: Boolean(DINGTALK_WEBHOOK_URL)
-      }
+      },
+      stats: typeof notifier.getStats === "function" ? notifier.getStats() : null
     },
+    aiQueue: aiAnalysisQueueStatusPayload(),
+    reliability: reliabilityStatusPayload(),
     remoteHosts: remoteHostStats,
     cache: {
       processTopCount: state.caches.processTop.length,
@@ -3030,6 +3205,35 @@ app.get("/api/events/analysis", async (req, res) => {
     return;
   }
 
+  if (!force) {
+    const existing = getEventAiAnalysis(eventId);
+    if (existing) {
+      res.json({
+        ok: true,
+        hostId,
+        eventId,
+        analysis: existing,
+        cached: true,
+        queue: aiAnalysisQueueStatusPayload()
+      });
+      return;
+    }
+  }
+
+  if (isAiAnalysisQueueSaturated()) {
+    reliabilityStats.analysisQueueRejects += 1;
+    res.setHeader("Retry-After", "2");
+    res.status(503).json({
+      ok: false,
+      code: "analysis_queue_full",
+      message: "AI analysis queue is full, retry later",
+      hostId,
+      eventId,
+      queue: aiAnalysisQueueStatusPayload()
+    });
+    return;
+  }
+
   let record = null;
   try {
     record = await analyzeEventIncident({
@@ -3086,7 +3290,8 @@ app.get("/api/events/analysis", async (req, res) => {
     ok: true,
     hostId,
     eventId,
-    analysis: record
+    analysis: record,
+    queue: aiAnalysisQueueStatusPayload()
   });
 });
 
@@ -3103,6 +3308,35 @@ app.post("/api/events/analysis", async (req, res) => {
     return;
   }
 
+  if (!force) {
+    const existing = getEventAiAnalysis(eventId);
+    if (existing) {
+      res.json({
+        ok: true,
+        hostId,
+        eventId,
+        analysis: existing,
+        cached: true,
+        queue: aiAnalysisQueueStatusPayload()
+      });
+      return;
+    }
+  }
+
+  if (isAiAnalysisQueueSaturated()) {
+    reliabilityStats.analysisQueueRejects += 1;
+    res.setHeader("Retry-After", "2");
+    res.status(503).json({
+      ok: false,
+      code: "analysis_queue_full",
+      message: "AI analysis queue is full, retry later",
+      hostId,
+      eventId,
+      queue: aiAnalysisQueueStatusPayload()
+    });
+    return;
+  }
+
   let record = null;
   try {
     record = await analyzeEventIncident({
@@ -3159,7 +3393,8 @@ app.post("/api/events/analysis", async (req, res) => {
     ok: true,
     hostId,
     eventId,
-    analysis: record
+    analysis: record,
+    queue: aiAnalysisQueueStatusPayload()
   });
 });
 
@@ -3270,7 +3505,8 @@ async function bootstrap() {
     try {
       storage = new SqliteStore({
         dbPath: SQLITE_DB_PATH,
-        retentionDays: SQLITE_RETENTION_DAYS
+        retentionDays: SQLITE_RETENTION_DAYS,
+        busyTimeoutMs: SQLITE_BUSY_TIMEOUT_MS
       });
       storageStatus.ready = true;
       storageStatus.degraded = false;

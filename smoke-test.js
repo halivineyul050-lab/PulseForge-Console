@@ -137,6 +137,7 @@ async function runSmokeTest() {
     assert(health.ok, "Health endpoint did not return ok=true");
     assert(typeof health.storage?.configured === "boolean", "Health missing storage.configured");
     assert(typeof health.storage?.enabled === "boolean", "Health missing storage.enabled");
+    assert(typeof health.reliability?.storageRetryScheduled === "number", "Health missing reliability.storageRetryScheduled");
 
     const storageStatus = await fetchJson(`${BASE_URL}/api/storage/status`);
     assert(typeof storageStatus.configured === "boolean", "Storage status missing configured");
@@ -156,6 +157,8 @@ async function runSmokeTest() {
 
     const notifier = await fetchJson(`${BASE_URL}/api/notifier`);
     assert(typeof notifier.enabled === "boolean", "Notifier status missing enabled flag");
+    assert(typeof notifier.retry?.maxAttempts === "number", "Notifier missing retry.maxAttempts");
+    assert(typeof notifier.stats?.totalRequests === "number", "Notifier missing stats.totalRequests");
 
     const remoteHostId = `smoke-agent-${Date.now()}`;
     const ingestHeaders = {
@@ -264,6 +267,7 @@ async function runSmokeTest() {
     const analysis = await fetchJson(`${BASE_URL}/api/events/analysis?hostId=${encodeURIComponent(remoteHostId)}&eventId=${encodeURIComponent(eventId)}`);
     assert(analysis.ok, "Event AI analysis request failed");
     assert(analysis.analysis?.analysis?.cause?.summary, "Event AI analysis missing cause summary");
+    assert(typeof analysis.queue?.queueLimit === "number", "Event AI analysis missing queue status");
 
     const hostsAfterIngest = await fetchJson(`${BASE_URL}/api/hosts`);
     assert(hostsAfterIngest.hosts.some((host) => host.hostId === remoteHostId), "Remote host missing from host list");
@@ -283,6 +287,7 @@ async function runSmokeTest() {
     const diagnostics = await fetchJson(`${BASE_URL}/api/diagnostics`);
     assert(diagnostics?.stats?.ticksTotal >= 1, "Diagnostics missing collector stats");
     assert(Array.isArray(diagnostics?.remoteHosts), "Diagnostics missing remoteHosts");
+    assert(typeof diagnostics?.reliability?.analysisQueueRejects === "number", "Diagnostics missing reliability.analysisQueueRejects");
 
     const csvResponse = await fetch(`${BASE_URL}/api/export.csv?minutes=5&hostId=${encodeURIComponent(hostsInitial.localHostId)}`);
     assert(csvResponse.ok, "CSV export request failed");

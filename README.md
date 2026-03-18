@@ -133,6 +133,10 @@ npm run smoke
 - `SQLITE_STRICT_STARTUP`：SQLite 初始化失败时是否阻止服务启动（默认 `1`）
 - `SQLITE_DB_PATH`：SQLite 文件路径（默认 `./data/pulseforge.db`）
 - `SQLITE_RETENTION_DAYS`：历史保留天数（默认 `7`）
+- `SQLITE_BUSY_TIMEOUT_MS`：SQLite 锁等待超时（默认 `4000`）
+- `STORAGE_WRITE_RETRY_MAX_ATTEMPTS`：持久化写入重试次数（默认 `4`）
+- `STORAGE_WRITE_RETRY_BASE_DELAY_MS`：写入重试基础延迟（默认 `80`）
+- `STORAGE_WRITE_RETRY_MAX_DELAY_MS`：写入重试最大延迟（默认 `1200`）
 - `HISTORY_QUERY_LIMIT_MAX`：历史查询最大返回点数（默认 `500000`）
 - `AGENT_API_KEY`：Agent 上报鉴权密钥（默认空，空表示不鉴权）
 - `AGENT_BODY_LIMIT`：Agent 接口请求体上限（默认 `2mb`）
@@ -143,6 +147,9 @@ npm run smoke
 - `DINGTALK_WEBHOOK_URL`：钉钉机器人 webhook
 - `DINGTALK_SECRET`：钉钉加签 secret（可选）
 - `NOTIFIER_TIMEOUT_MS`：通知通道请求超时（默认 `5000`）
+- `NOTIFIER_RETRY_MAX_ATTEMPTS`：通知发送最大重试次数（默认 `3`）
+- `NOTIFIER_RETRY_BASE_DELAY_MS`：通知重试基础延迟（默认 `250`）
+- `NOTIFIER_RETRY_MAX_DELAY_MS`：通知重试最大延迟（默认 `2000`）
 - `AI_ANALYZER_ENABLED`：是否启用 AI 分析（默认 `1`）
 - `AI_ANALYZER_API_KEY`：AI Provider API Key（可用 `OPENAI_API_KEY` 兼容）
 - `AI_ANALYZER_BASE_URL`：AI API 地址（默认 `https://api.openai.com/v1`）
@@ -173,6 +180,7 @@ set PORT=4600 && set SAMPLE_RATE_MS=500 && npm start
 ## HTTP API
 
 - `GET /api/health`：健康状态
+- `GET /api/health` 额外返回 `reliability`（存储重试、队列拒绝、通知统计）
 - `GET /api/storage/status`：持久化状态（是否降级/错误原因）
 - `GET /api/hosts`：主机列表（本机 + Agent）
 - `GET /api/meta?hostId=...`：指定主机元信息 + 采样配置
@@ -184,9 +192,13 @@ set PORT=4600 && set SAMPLE_RATE_MS=500 && npm start
 - `GET /api/events?hostId=...&limit=120&source=auto`：指定主机事件
 - `GET /api/events/analysis?hostId=...&eventId=...`：获取/触发单事件 AI 根因分析
 - `POST /api/events/analysis`：触发单事件 AI 根因分析（Body: `hostId,eventId,force`）
+- 当 AI 队列拥塞时，`/api/events/analysis` 返回 `503` 与 `code=analysis_queue_full`
+- 队列拥塞响应附带 `Retry-After: 2`，建议客户端按该值退避重试
 - `GET /api/export.csv?hostId=...&minutes=5`：导出指定主机 CSV
 - `POST /api/agent/ingest`：Agent 上报接口（支持单样本/批量）
 - `GET /api/notifier`：通知通道状态
+- `GET /api/notifier` 返回重试参数（`retry.maxAttempts/baseDelayMs/maxDelayMs`）
+- `GET /api/notifier` 同时返回通知发送统计（`stats.totalRequests/totalRetries/...`）
 - `POST /api/notifier/test`：发送通知测试消息
 - `GET /api/diagnostics`：采样器性能与缓存诊断
 

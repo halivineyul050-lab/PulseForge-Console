@@ -29,12 +29,14 @@ class SqliteStore {
 
     this.dbPath = dbPath;
     this.retentionDays = Number.isFinite(retentionDays) ? Math.max(1, retentionDays) : 7;
+    this.busyTimeoutMs = Math.max(100, Number(options.busyTimeoutMs || 4000));
     this.lastPruneTs = 0;
 
     const dbDir = path.dirname(dbPath);
     fs.mkdirSync(dbDir, { recursive: true });
 
     this.db = new DatabaseSync(dbPath);
+    this.db.exec(`PRAGMA busy_timeout = ${Math.round(this.busyTimeoutMs)}`);
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA temp_store = MEMORY");
@@ -60,6 +62,7 @@ class SqliteStore {
       );
 
       CREATE INDEX IF NOT EXISTS idx_samples_host_ts ON samples(host_id, ts);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_host_ts_unique ON samples(host_id, ts);
 
       CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
@@ -100,6 +103,9 @@ class SqliteStore {
       insertSample: this.db.prepare(`
         INSERT INTO samples(host_id, ts, iso_time, sample_json)
         VALUES(?, ?, ?, ?)
+        ON CONFLICT(host_id, ts) DO UPDATE SET
+          iso_time = excluded.iso_time,
+          sample_json = excluded.sample_json
       `),
       insertEvent: this.db.prepare(`
         INSERT OR REPLACE INTO events(id, host_id, ts, level, type, content, event_json)
@@ -231,9 +237,22 @@ class SqliteStore {
 
     const retentionMs = this.retentionDays * 24 * 60 * 60 * 1000;
     const cutoff = nowTs - retentionMs;
-    this.statements.deleteOldSamples.run(cutoff);
-    this.statements.deleteOldEvents.run(cutoff);
-    this.statements.deleteOldEventAnalyses.run(cutoff);
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.statements.deleteOldSamples.run(cutoff);
+      this.statements.deleteOldEvents.run(cutoff);
+      this.statements.deleteOldEventAnalyses.run(cutoff);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // ignore rollback errors
+      }
+      throw error;
+    }
+
     this.lastPruneTs = nowTs;
   }
 
