@@ -10,7 +10,8 @@
     "agent": "node agent.js",
     "check": "node --check server.js && node --check app.js && node --check agent.js && node --check smoke-test.js",
     "smoke": "node smoke-test.js",
-    "package:win": "node tools/package-win.js"
+    "package:win": "node tools/package-win.js",
+    "package:installer": "node tools/build-installer.js"
   },
   "dependencies": {
     "compression": "^1.8.1",

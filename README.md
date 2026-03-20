@@ -102,6 +102,21 @@ npm run package:win
 - `启动监控.bat`
 - `停止监控.bat`
 
+## 构建安装包（Setup.exe）
+
+```bash
+npm run package:installer
+```
+
+输出目录：
+
+- `dist/installer/PulseForge-Console-Setup.exe`
+
+说明：
+
+- 该命令依赖 Inno Setup 6（`ISCC.exe`）。
+- 若本机未安装，会自动生成安装脚本：`dist/installer/PulseForge-Console.iss`，安装 Inno Setup 后可手动编译。
+
 ## 启动 Agent（多主机）
 
 在远端主机执行：
