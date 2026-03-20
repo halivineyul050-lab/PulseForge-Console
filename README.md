@@ -86,6 +86,22 @@ npm install
 npm start
 ```
 
+## 打包分发（Windows）
+
+```bash
+npm run package:win
+```
+
+输出：
+
+- `dist/PulseForge-Console-Windows/`（分发目录）
+- `dist/PulseForge-Console-Windows.zip`（可直接发给别人）
+
+分发给别人后，让对方解压并双击：
+
+- `启动监控.bat`
+- `停止监控.bat`
+
 ## 启动 Agent（多主机）
 
 在远端主机执行：
